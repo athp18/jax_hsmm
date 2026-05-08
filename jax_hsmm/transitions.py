@@ -89,10 +89,13 @@ def _sample_crp_tables(rng: np.random.Generator, n: int, concentration: float) -
     var = concentration * (
         polygamma(1, concentration) - polygamma(1, concentration + n)
     )
-    
-    if var <= 0 or mean <= 0:
-        return max(1, int(round(mean)))
-    
+
+    # polygamma(1, x) > 0 always, but floating-point cancellation can produce
+    # var ≈ 0 when n is very large (both terms nearly equal).  Fall back to the
+    # rounded mean when variance is too small for a useful Normal approximation.
+    if var < 1e-10 or mean <= 0:
+        return int(np.clip(round(mean), 1, n))
+
     # Normal approximation — accurate when mean >> 1
     sample = rng.normal(mean, np.sqrt(var))
     return int(np.clip(round(sample), 1, n))
