@@ -386,7 +386,7 @@ class ARHMM:
         if self.separate_trans and group_ids is not None:
             unique_groups = sorted(set(group_ids), key=str)
             params['pi_groups'] = {
-                g: np.full((self.K, self.K), 1.0 / self.K)
+                g: self.rng.dirichlet(np.ones(self.K), size=self.K)
                 for g in unique_groups
             }
 
