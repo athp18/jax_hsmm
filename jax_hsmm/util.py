@@ -14,6 +14,7 @@ count_frames_wrapper
 
 import numpy as np
 import jax.numpy as jnp
+import h5py
 
 
 def regularize_for_stability(
@@ -164,7 +165,6 @@ def count_frames_wrapper(input_file: str, var_name: str = 'scores', npcs: int = 
     Returns:
         Total number of frames across all sessions.
     """
-    import h5py
 
     total_frames = 0
     with h5py.File(input_file, 'r') as f:
