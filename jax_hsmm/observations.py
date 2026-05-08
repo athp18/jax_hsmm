@@ -431,7 +431,10 @@ def default_mniw_prior(obs_dim: int, ar_lags: int, affine: bool = False) -> dict
     return dict(
         M_0   = M_0,
         V_0   = 10.0 * np.eye(D_phi),   # matches moseq2-model K_0_scale=10.0
-        Psi_0 = np.eye(D) * D,           # E[Sigma] ≈ I
+        Psi_0 = np.eye(D) * 0.01,        # matches moseq2-model S_0_scale=0.01
+                                          # E[Sigma]=Psi_0/(nu_0-D-1)=0.01*I; keeps
+                                          # prior draws tight so low-count states
+                                          # don't steal frames via inflated likelihoods
         nu_0  = float(D + 2),
     )
 
