@@ -138,13 +138,20 @@ def hmm_expected_states(
     Returns:
         expected_states: (T, K)  Posterior state marginals (rows sum to 1).
     """
-    log_alphas = hmm_forward(log_pi0, log_A, log_likelihoods)      # (T, K)
-    log_betas  = hmm_backward_msgs(log_A, log_likelihoods)          # (T, K)
+    # Upcast to float64 for the forward-backward pass so that the per-row
+    # normalisation error stays well within 1e-5 for long sequences.
+    # float32 accumulates ~1e-4 error over hundreds of timesteps.
+    log_pi0_64  = log_pi0.astype(jnp.float64)
+    log_A_64    = log_A.astype(jnp.float64)
+    log_liks_64 = log_likelihoods.astype(jnp.float64)
 
-    log_gamma = log_alphas + log_betas                              # (T, K)
+    log_alphas = hmm_forward(log_pi0_64, log_A_64, log_liks_64)      # (T, K)
+    log_betas  = hmm_backward_msgs(log_A_64, log_liks_64)             # (T, K)
+
+    log_gamma = log_alphas + log_betas                                # (T, K)
     # Normalise each time step.
     log_gamma -= jax.nn.logsumexp(log_gamma, axis=1, keepdims=True)
-    return jnp.exp(log_gamma)
+    return jnp.exp(log_gamma).astype(jnp.float32)
 
 
 @jit
