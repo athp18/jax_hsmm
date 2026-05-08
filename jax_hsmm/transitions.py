@@ -139,27 +139,30 @@ def sample_beta(
     rng: np.random.Generator,
     m: np.ndarray,
     gamma: float,
+    alpha: float = 0.0,
+    kappa: float = 0.0,
+    beta: np.ndarray = None,
 ) -> np.ndarray:
-    """Sample global mixture weights beta ~ Dir(m_bar + gamma/K).
-
-    m_bar[j] = Σ_i m[i, j]  minus the "override" counts (handled by
-    the sticky term separately — here we use the standard Fox et al.
-    formulation where m_bar already excludes the sticky override).
-
-    Args:
-        rng:   numpy random Generator.
-        m:     (K, K) CRF table counts.
-        gamma: HDP top-level concentration.
-
-    Returns:
-        beta: (K,) Dirichlet sample (sums to 1).
-    """
     K = m.shape[0]
-    # m_bar[j] = column sums of m (total tables assigned to global dish j)
-    m_bar = m.sum(axis=0).astype(float)   # (K,)
-    concentration = m_bar + gamma / K
-    # Guard: Dirichlet requires all params > 0.
-    concentration = np.maximum(concentration, 1e-8)
+    m_corrected = m.copy().astype(float)
+
+    # Fox et al (2008) override correction for sticky HDP-HMM.
+    # Thin each diagonal entry: keep only the tables that represent genuine
+    # global dish k popularity, stripping out the kappa self-transition bonus.
+    # keep_prob = alpha*beta[k] / (alpha*beta[k] + kappa)
+    if kappa > 0.0 and beta is not None:
+        diag_idx = np.arange(K)
+        diag_vals = m[diag_idx, diag_idx].astype(int)
+        nonzero = diag_vals > 0
+        if nonzero.any():
+            denom = alpha * np.asarray(beta) + kappa
+            keep_prob = np.where(denom > 0, alpha * np.asarray(beta) / denom, 0.0)
+            keep_prob = np.clip(keep_prob, 0.0, 1.0)
+            thinned = rng.binomial(diag_vals[nonzero], keep_prob[nonzero])
+            m_corrected[diag_idx[nonzero], diag_idx[nonzero]] = thinned
+
+    m_bar = m_corrected.sum(axis=0)
+    concentration = np.maximum(m_bar + gamma / K, 1e-8)
     return rng.dirichlet(concentration)
 
 
