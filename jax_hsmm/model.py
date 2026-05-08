@@ -371,10 +371,9 @@ class ARHMM:
             stats = compute_sufficient_stats(phi_cat, x_cat, states_cat, self.K)
 
         # ---- (2a) Regularise stats for numerical stability ----
-        # Gate on self._obs_stats is not None: skip the very first sweep where
-        # stats come from dummy data (mirrors moseq2-model's train_model gate).
-        if self._obs_stats is not None:
-            stats = regularize_for_stability(stats, self.obs_prior)
+        # Always run — iteration 0 with random state assignments is the most
+        # likely case to produce degenerate S_yy (many states with few frames).
+        stats = regularize_for_stability(stats, self.obs_prior)
 
         A_new, Sigma_new = sample_obs_params(stats, self.obs_prior, self.rng)
 
@@ -853,8 +852,7 @@ class ARHSMM(ARHMM):
         # Regularise stats for numerical stability before IW sampling.
         # Gated on self._obs_stats is not None to skip the first sweep
         # (mirrors ARHMM._gibbs_step and moseq2-model's train_model gate).
-        if self._obs_stats is not None:
-            stats = regularize_for_stability(stats, self.obs_prior)
+        stats = regularize_for_stability(stats, self.obs_prior)
 
         A_new, Sigma_new = sample_obs_params(stats, self.obs_prior, self.rng)
 
