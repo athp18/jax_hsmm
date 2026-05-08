@@ -238,6 +238,31 @@ class ARHMM:
         self._group_ids      = None
         self.expected_states = None
 
+        # Set to True to print per-step diagnostics inside _gibbs_step.
+        self.debug = True
+        self._gibbs_iter = 0   # incremented each sweep for log prefixes
+
+    # ------------------------------------------------------------------
+    # Debug helper
+    # ------------------------------------------------------------------
+
+    def _dbg(self, tag, arr):
+        """Print NaN/Inf/range diagnostics for array ``arr`` under ``tag``."""
+        if not self.debug:
+            return
+        a = np.asarray(arr, dtype=np.float64)
+        n_nan  = int(np.isnan(a).sum())
+        n_inf  = int(np.isinf(a).sum())
+        finite = a[np.isfinite(a)]
+        if finite.size:
+            lo, hi = float(finite.min()), float(finite.max())
+            rng_str = f"range=[{lo:.3g}, {hi:.3g}]"
+        else:
+            rng_str = "range=ALL_NON-FINITE"
+        flag = "  *** BAD ***" if (n_nan or n_inf) else ""
+        print(f"  [iter {self._gibbs_iter}] {tag}: shape={a.shape}  "
+              f"NaN={n_nan}  Inf={n_inf}  {rng_str}{flag}")
+
     # ------------------------------------------------------------------
     # Whitening helpers
     # ------------------------------------------------------------------
@@ -319,8 +344,14 @@ class ARHMM:
         Returns:
             new_params, state_seqs
         """
+        self._gibbs_iter += 1
+
         A, Sigma = params['A'], params['Sigma']
         beta     = params['beta']
+
+        self._dbg("params/A",     A)
+        self._dbg("params/Sigma", Sigma)
+        self._dbg("params/beta",  beta)
 
         log_pi0 = jnp.log(jnp.array(beta) + 1e-300)
 
@@ -343,10 +374,26 @@ class ARHMM:
             else:
                 log_liks = ar_log_likelihoods(phi_j, x_j, A, Sigma)
 
+            self._dbg(f"session {i} log_liks", log_liks)
+
             log_alphas = hmm_forward(log_pi0, log_A, log_liks)
+            self._dbg(f"session {i} log_alphas", log_alphas)
+
             key, subkey = jax.random.split(key)
             states = hmm_backward_sample(subkey, log_A, log_alphas)
-            state_seqs.append(np.array(states))
+            states_np = np.array(states)
+
+            # Always report state occupancy — useful even without debug=True
+            # when you're actively hunting a crash.
+            if self.debug:
+                counts = np.bincount(states_np, minlength=self.K)
+                n_used = int((counts > 0).sum())
+                print(f"  [iter {self._gibbs_iter}] session {i}: "
+                      f"{n_used}/{self.K} states used  "
+                      f"min_count={counts[counts>0].min() if n_used else 0}  "
+                      f"max_count={counts.max()}")
+
+            state_seqs.append(states_np)
             all_phi.append(phi_j)
             all_x.append(x_j)
 
@@ -363,6 +410,8 @@ class ARHMM:
                 np.array(A), np.array(Sigma),
                 self.nu,
             )
+            tau = np.clip(tau, 0.0, 1e4)
+            self._dbg("robust tau weights", tau)
             stats = compute_weighted_sufficient_stats(
                 phi_cat, x_cat, states_cat, self.K,
                 jnp.array(tau, dtype=jnp.float32),
@@ -370,12 +419,22 @@ class ARHMM:
         else:
             stats = compute_sufficient_stats(phi_cat, x_cat, states_cat, self.K)
 
+        self._dbg("stats/n",    stats['n'])
+        self._dbg("stats/S_xx", stats['S_xx'])
+        self._dbg("stats/S_xy", stats['S_xy'])
+        self._dbg("stats/S_yy", stats['S_yy'])
+
         # ---- (2a) Regularise stats for numerical stability ----
         # Always run — iteration 0 with random state assignments is the most
         # likely case to produce degenerate S_yy (many states with few frames).
         stats = regularize_for_stability(stats, self.obs_prior)
 
+        self._dbg("stats/S_yy (post-regularize)", stats['S_yy'])
+
         A_new, Sigma_new = sample_obs_params(stats, self.obs_prior, self.rng)
+
+        self._dbg("A_new",     A_new)
+        self._dbg("Sigma_new", Sigma_new)
 
         # ---- (3) Sample transition parameters ----
         if self.separate_trans and group_ids is not None:
@@ -448,6 +507,76 @@ class ARHMM:
 
         return params
 
+    def _warm_start_params(self, key, prepped_data, group_ids=None):
+        """Initialise parameters from uniform round-robin state assignments.
+
+        Mirrors pyhsmm's params-first ordering: assign states uniformly across
+        each session, compute sufficient statistics from those assignments, then
+        sample A/Sigma/pi/beta from the data-informed posterior.  This avoids
+        the collapse that results from running FFBS first with random prior
+        parameters.
+
+        chunk_size = max(10, T // K) so each state sees at least ~chunk_size
+        frames before the first FFBS sweep.
+        """
+        K = self.K
+
+        # Build uniform round-robin state sequences for every session.
+        warmup_seqs = []
+        for phi, x in prepped_data:
+            T = phi.shape[0]
+            chunk = max(10, T // K)
+            states = np.array(
+                [t // chunk % K for t in range(T)], dtype=np.int32
+            )
+            warmup_seqs.append(states)
+
+        # Accumulate sufficient statistics from the uniform assignments.
+        # Always use the unweighted version here — no tau weights exist yet.
+        phi_cat    = jnp.concatenate([jnp.array(phi) for phi, _ in prepped_data], axis=0)
+        x_cat      = jnp.concatenate([jnp.array(x)   for _, x   in prepped_data], axis=0)
+        states_cat = jnp.array(np.concatenate(warmup_seqs, axis=0))
+
+        stats = compute_sufficient_stats(phi_cat, x_cat, states_cat, K)
+        stats = regularize_for_stability(stats, self.obs_prior)
+
+        A, Sigma = sample_obs_params(stats, self.obs_prior, self.rng)
+
+        # Sample transition parameters from the warm-start sequences.
+        if self.separate_trans and group_ids is not None:
+            seqs_by_group: dict = {}
+            for seq, g_id in zip(warmup_seqs, group_ids):
+                seqs_by_group.setdefault(g_id, []).append(seq)
+            _, _pi0, beta = init_transitions(
+                K, self.trans_params['alpha'],
+                self.trans_params['kappa'], self.trans_params['gamma'],
+            )
+            pi_groups, beta = sample_transitions_separate(
+                self.rng, seqs_by_group, beta, self.trans_params
+            )
+            pi_pooled = np.mean(list(pi_groups.values()), axis=0)
+            params = dict(
+                A=A, Sigma=Sigma,
+                pi=pi_pooled, pi_groups=pi_groups,
+                beta=beta,
+            )
+        else:
+            _, _pi0, beta = init_transitions(
+                K, self.trans_params['alpha'],
+                self.trans_params['kappa'], self.trans_params['gamma'],
+            )
+            pi, beta = sample_transitions(
+                self.rng, warmup_seqs, beta, self.trans_params
+            )
+            params = dict(A=A, Sigma=Sigma, pi=pi, beta=beta)
+
+        print(f"[warm-start] A range=[{float(np.array(A).min()):.3g}, "
+              f"{float(np.array(A).max()):.3g}]  "
+              f"Sigma range=[{float(np.array(Sigma).min()):.3g}, "
+              f"{float(np.array(Sigma).max()):.3g}]")
+
+        return params
+
     def fit(
         self,
         key,
@@ -499,7 +628,7 @@ class ARHMM:
         prepped = _prep_data(data_list, self.lag, self.affine)
         self._prepped_data = prepped
 
-        params   = self.init_params(key, data_list, group_ids=group_ids)
+        params   = self._warm_start_params(key, prepped, group_ids=group_ids)
         samples  = []
         iter_lls = []
 
