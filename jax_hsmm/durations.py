@@ -47,11 +47,17 @@ def poisson_log_dur_matrix(
     """
     d = jnp.arange(1, max_dur + 1, dtype=jnp.float32)   # (max_dur,)
 
+    # log(d!) = cumsum(log(1), log(2), ..., log(d)) computed entirely in JAX
+    # so it is part of the compiled graph and avoids a Python loop at trace time.
+    log_factorial = jnp.concatenate(
+        [jnp.zeros(1), jnp.cumsum(jnp.log(jnp.arange(1, max_dur + 1, dtype=jnp.float32)))]
+    )[1:]  # shape (max_dur,); entry i = log((i+1)!)
+
     # log Poisson PMF (unnormalised over d >= 1):
     # log p(d | lambda) = d * log(lambda) - lambda - log(d!)
     log_pmf = (d[None, :] * jnp.log(lam[:, None])
                - lam[:, None]
-               - jnp.array([_log_factorial(i) for i in range(1, max_dur + 1)])[None, :])
+               - log_factorial[None, :])
     # (K, max_dur)
 
     # Normalise over the truncated support [1, max_dur].
@@ -63,7 +69,7 @@ def poisson_log_dur_matrix(
 
 
 def _log_factorial(n: int) -> float:
-    """log(n!) using Stirling-accurate recursion (called at trace time)."""
+    """log(n!) — retained for any external callers; no longer used internally."""
     if n <= 1:
         return 0.0
     val = 0.0
