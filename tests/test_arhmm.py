@@ -219,23 +219,23 @@ class TestWhitening:
 
     def test_whitening_params_stored(self):
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM,
-                      ar_lags=AR_LAGS, whiten=True, seed=0)
+                      ar_lags=AR_LAGS, whiten='all', seed=0)
         model.fit(_make_key(), _make_data(), n_iter=2, verbose=False)
-        assert model.whiten_mean  is not None
-        assert model.whiten_L_inv is not None
-        assert model.whiten_mean.shape  == (OBS_DIM,)
-        assert model.whiten_L_inv.shape == (OBS_DIM, OBS_DIM)
+        wp = model.whitening_parameters
+        assert wp is not None
+        assert wp['mu'].shape == (OBS_DIM,)
+        assert wp['L'].shape  == (OBS_DIM, OBS_DIM)
 
     def test_no_whitening_params_when_disabled(self):
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM,
-                      ar_lags=AR_LAGS, whiten=False, seed=0)
+                      ar_lags=AR_LAGS, whiten='none', seed=0)
         model.fit(_make_key(), _make_data(), n_iter=2, verbose=False)
-        assert model.whiten_mean is None
+        assert model.whitening_parameters is None
 
     def test_unwhiten_roundtrip(self):
         data  = _make_data(n_sessions=1, T=300)
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM,
-                      ar_lags=AR_LAGS, whiten=True, seed=0)
+                      ar_lags=AR_LAGS, whiten='all', seed=0)
         model.fit(_make_key(), data, n_iter=2, verbose=False)
 
         # Whiten then unwhiten should recover original data
