@@ -14,7 +14,6 @@ count_frames_wrapper
 
 import numpy as np
 import jax.numpy as jnp
-import h5py
 
 
 def regularize_for_stability(
@@ -77,10 +76,33 @@ def regularize_for_stability(
 
     any_modified = False
 
+    # Diagonal scale for relative ridge sizing (state-independent).
+    S_xx_diag_scale = max(float(np.abs(np.diag(A_prior)).mean()), 1.0)
+
     for k in range(K):
         if n[k] < D_x + 2:
             # Fewer observations than needed for a proper posterior:
             # sample_obs_params will draw from the prior, so skip.
+            continue
+
+        # --- Non-finite guard ---
+        # NaN/Inf in sufficient statistics (from exploding AR predictions)
+        # propagates into Psi_n and causes eigvalsh/cholesky to raise with
+        # cryptic errors.  Zero out the contaminated state's stats so it
+        # falls through to a prior-draw in sample_obs_params.
+        if (not np.isfinite(S_xx[k]).all()
+                or not np.isfinite(S_xy[k]).all()
+                or not np.isfinite(S_yy[k]).all()):
+            if verbose:
+                print(
+                    f"regularize_for_stability: state {k:3d}  "
+                    f"non-finite stats — resetting to prior draw"
+                )
+            S_xx[k] = np.zeros_like(S_xx[k])
+            S_xy[k] = np.zeros_like(S_xy[k])
+            S_yy[k] = np.zeros_like(S_yy[k])
+            n[k]    = 0.0          # forces prior draw in sample_obs_params
+            any_modified = True
             continue
 
         B = MV_0 + S_xy[k]   # (D_x, D_phi)
@@ -88,29 +110,52 @@ def regularize_for_stability(
         lam = 0.0
         is_pd = False
 
-        for _iter in range(300):        # safety cap on iterations
+        for _iter in range(200):        # safety cap on iterations
             C = V_0 + S_yy[k] + lam * I_phi    # (D_phi, D_phi)
             try:
-                C_chol = np.linalg.cholesky(C)
+                np.linalg.cholesky(C)
                 # Schur: A_prior + S_xx[k] - B C^{-1} B'
-                # Use cholesky solve for numerical safety: C^{-1} B' = (C \ B')
+                # Use solve for numerical safety: C^{-1} B' = (C \ B')
                 C_inv_Bt = np.linalg.solve(C, B.T)   # (D_phi, D_x)
                 Psi_n = A_prior + S_xx[k] - B @ C_inv_Bt
             except np.linalg.LinAlgError:
-                lam = max(lam * 1.1, 1e-6)
+                lam = max(lam * 2.0, S_xx_diag_scale * 1e-8)
                 continue
 
             Psi_n = (Psi_n + Psi_n.T) * 0.5       # symmetrise
-            min_eig = np.linalg.eigvalsh(Psi_n).min()
+
+            # Guard eigvalsh against non-finite Psi_n — can arise when S_xx
+            # is very large and C has not yet been regularized enough.
+            if not np.isfinite(Psi_n).all():
+                lam = max(lam * 2.0, S_xx_diag_scale * 1e-8)
+                continue
+
+            try:
+                min_eig = np.linalg.eigvalsh(Psi_n).min()
+            except np.linalg.LinAlgError:
+                lam = max(lam * 2.0, S_xx_diag_scale * 1e-8)
+                continue
 
             if min_eig > 1e-8:
                 is_pd = True
                 break
 
-            # Escalate ridge geometrically.
-            lam = max(lam * 1.05, 1e-4)
+            # Escalate ridge geometrically (factor 2 for fast convergence).
+            lam = max(lam * 2.0, S_xx_diag_scale * 1e-8)
 
-        if lam > 0.0:
+        if not is_pd:
+            # Could not stabilize: zero out so sample_obs_params uses prior.
+            if verbose:
+                print(
+                    f"regularize_for_stability: state {k:3d}  "
+                    f"n={int(n[k])}  could not make PD — resetting to prior draw"
+                )
+            S_xx[k] = np.zeros_like(S_xx[k])
+            S_xy[k] = np.zeros_like(S_xy[k])
+            S_yy[k] = np.zeros_like(S_yy[k])
+            n[k]    = 0.0
+            any_modified = True
+        elif lam > 0.0:
             if verbose:
                 print(
                     f"regularize_for_stability: state {k:3d}  "
@@ -121,9 +166,9 @@ def regularize_for_stability(
 
     if any_modified:
         return dict(
-            n    = stats['n'],
-            S_xx = stats['S_xx'],
-            S_xy = stats['S_xy'],
+            n    = jnp.array(n),
+            S_xx = jnp.array(S_xx),
+            S_xy = jnp.array(S_xy),
             S_yy = jnp.array(S_yy),
         )
     return stats
@@ -165,6 +210,7 @@ def count_frames_wrapper(input_file: str, var_name: str = 'scores', npcs: int = 
     Returns:
         Total number of frames across all sessions.
     """
+    import h5py
 
     total_frames = 0
     with h5py.File(input_file, 'r') as f:
