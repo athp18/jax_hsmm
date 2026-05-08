@@ -276,7 +276,7 @@ def sample_robust_weights(
     state_mah = mah_all[np.arange(len(states)), np.array(states)]  # (T,)
 
     a = (nu + D) / 2.0
-    b = (nu + state_mah) / 2.0
+    b = np.maximum((nu + state_mah) / 2.0, 1e-8)
     return rng.gamma(a, 1.0 / b)   # (T,)
 
 
@@ -334,9 +334,14 @@ def sample_obs_params(
             A_k = M_0 + L_S @ Z @ L_V.T
         else:
             # Posterior MNIW update.
-            V_n   = V_0 + S_yy[k]
-            V_n_i = np.linalg.inv(V_n)
-            M_n   = (S_xy[k] + M_0 @ V_0) @ V_n_i
+            V_n = np.array(V_0 + S_yy[k], dtype=np.float64)
+            # Symmetrise and ridge before Cholesky — S_yy[k] comes from JAX
+            # float32 and can introduce tiny asymmetries / negative eigenvalues.
+            V_n = (V_n + V_n.T) * 0.5
+            ridge = np.abs(np.diag(V_n)).mean() * 1e-8
+            V_n += ridge * np.eye(D_phi)
+            V_n_chol = np.linalg.cholesky(V_n)
+            M_n = np.linalg.solve(V_n, (S_xy[k] + M_0 @ V_0).T).T
 
             nu_n  = nu_0 + n_k
             Psi_n = (Psi_0
@@ -357,11 +362,12 @@ def sample_obs_params(
             Sigma_k = invwishart.rvs(df=int(nu_n), scale=Psi_n, random_state=rng)
 
             # Sample A_k | Sigma_k ~ MN(M_n, Sigma_k, V_n^{-1}).
-            # vec(A_k^T) ~ N(vec(M_n^T), V_n^{-1} ⊗ Sigma_k)
-            L_S = np.linalg.cholesky(Sigma_k)
-            L_V = np.linalg.cholesky(V_n_i)
-            Z   = rng.standard_normal((D_x, D_phi))
-            A_k = M_n + L_S @ Z @ L_V.T
+            # V_n = L_V L_V^T  →  sample = M_n + L_S @ Z @ L_V^{-1}
+            # Avoid cholesky(V_n^{-1}) which loses PD under float32 rounding.
+            L_S   = np.linalg.cholesky(Sigma_k)
+            L_V_i = np.linalg.solve(V_n_chol, np.eye(D_phi))  # L_V^{-1}
+            Z     = rng.standard_normal((D_x, D_phi))
+            A_k   = M_n + L_S @ Z @ L_V_i
 
         A_all[k]     = A_k
         Sigma_all[k] = Sigma_k
