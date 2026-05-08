@@ -206,8 +206,16 @@ class ARHMM:
         self.whiten_L_inv = None
 
         self.obs_prior = default_mniw_prior(obs_dim, ar_lags, affine=affine)
+
+        # When separate_trans=True, each group gets its own pi_g sampled from
+        # Dir(alpha*beta + kappa*e_k + n_g[k,:]).  With kappa=1e6 the diagonal
+        # concentration is 1e6 vs ~0.1 off-diagonal regardless of group counts,
+        # so all groups produce indistinguishable near-identity matrices.
+        # Cap kappa at 100 for separate_trans so group-specific transition
+        # structure can actually emerge from the data.
+        effective_kappa = min(kappa, 100.0) if separate_trans else kappa
         self.trans_params, _pi0, _beta0 = init_transitions(
-            n_states, alpha, kappa, gamma
+            n_states, alpha, effective_kappa, gamma
         )
 
         # State / stat storage updated after every Gibbs sweep.
