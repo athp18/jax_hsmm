@@ -328,6 +328,11 @@ def sample_obs_params(
         if n_k < D_x + 2:
             # Too few observations: sample directly from prior.
             Sigma_k = invwishart.rvs(df=int(nu_0), scale=Psi_0, random_state=rng)
+            eigs, vecs = np.linalg.eigh(Sigma_k)
+            if eigs.min() < 1e-6:
+                eigs = np.maximum(eigs, 1e-6)
+                Sigma_k = vecs @ np.diag(eigs) @ vecs.T
+                Sigma_k = (Sigma_k + Sigma_k.T) * 0.5
             L_S = np.linalg.cholesky(Sigma_k)
             L_V = np.linalg.cholesky(np.linalg.inv(V_0))
             Z   = rng.standard_normal((D_x, D_phi))
