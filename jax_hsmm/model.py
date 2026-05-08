@@ -212,6 +212,9 @@ class ARHMM:
         self.lag             = ar_lags
         self.nlags           = ar_lags
         self.affine          = affine
+        # Accept bool (True->'all', False->'none') for backward compatibility.
+        if isinstance(whiten, bool):
+            whiten = 'all' if whiten else 'none'
         self.whiten_mode     = (whiten or 'none').lower()
         self.empirical_bayes = empirical_bayes
         self.separate_trans  = separate_trans
@@ -456,6 +459,7 @@ class ARHMM:
         group_ids=None,
         checkpoint_freq=None,
         checkpoint_path=None,
+        check_every=5,
     ):
         """Run the Gibbs sampler.
 
@@ -469,9 +473,13 @@ class ARHMM:
                              separate_trans=True.  Labels can be any hashable.
             checkpoint_freq: Save a checkpoint every N iterations (None to disable).
             checkpoint_path: Directory to write checkpoint files into.
+            check_every:     Record log-likelihood every N iterations (default 5).
+                             Matches moseq2-model's check_every parameter.
 
         Returns:
-            samples: List of parameter dicts (one per stored iteration).
+            samples:  List of parameter dicts (one per stored iteration).
+            iter_lls: List of (iteration, log_likelihood) tuples recorded
+                      every check_every iterations.
         """
         if self.separate_trans and group_ids is None:
             raise ValueError(
@@ -492,8 +500,9 @@ class ARHMM:
         prepped = _prep_data(data_list, self.lag, self.affine)
         self._prepped_data = prepped
 
-        params  = self.init_params(key, data_list, group_ids=group_ids)
-        samples = []
+        params   = self.init_params(key, data_list, group_ids=group_ids)
+        samples  = []
+        iter_lls = []
 
         if checkpoint_freq is not None and checkpoint_path is not None:
             os.makedirs(checkpoint_path, exist_ok=True)
@@ -506,24 +515,30 @@ class ARHMM:
             if (i + 1) % store_every == 0:
                 samples.append(_store_params(params))
 
+            if check_every is not None and (i + 1) % check_every == 0:
+                ll = self.log_likelihood(params=params)
+                iter_lls.append((i + 1, ll))
+
             if (checkpoint_freq is not None
                     and checkpoint_path is not None
                     and (i + 1) % checkpoint_freq == 0):
-                self._save_checkpoint(i + 1, params, samples, checkpoint_path)
+                self._save_checkpoint(i + 1, params, samples, iter_lls, checkpoint_path)
 
-        return samples
+        self.iter_lls = iter_lls
+        return samples, iter_lls
 
-    def _save_checkpoint(self, itr, params, samples, checkpoint_path):
+    def _save_checkpoint(self, itr, params, samples, iter_lls, checkpoint_path):
         """Save a checkpoint to disk.
 
         Format mirrors moseq2-model's save_arhmm_checkpoint:
-            iter, model, params, samples, log_likelihood, labels.
+            iter, model, params, samples, log_likelihood, labels, iter_lls.
         """
         checkpoint = {
             'iter':           itr,
             'model':          self,
             'params':         _store_params(params),
             'samples':        samples,
+            'iter_lls':       iter_lls,
             'log_likelihood': self.log_likelihood(),
             'labels':         self.get_labels(),
         }
@@ -547,7 +562,7 @@ class ARHMM:
         """
         with open(checkpoint_file, 'rb') as f:
             checkpoint = pickle.load(f)
-        return checkpoint['model'], checkpoint['samples'], checkpoint['iter']
+        return checkpoint['model'], checkpoint['samples'], checkpoint['iter'], checkpoint.get('iter_lls', [])
 
 
     def viterbi(self, params, data_list, group_ids=None):
@@ -651,7 +666,7 @@ class ARHMM:
         Args:
             params:    Parameter dict.  None → use self._params (requires fit()).
             data_list: List of raw (T_i, D) arrays.  None → use cached prepped data.
-            group_ids: Group labels for separate_trans routing.  None → use stored.
+            group_ids: List of group labels for separate_trans routing.
 
         Returns:
             Scalar float (sum over all sessions).
@@ -661,27 +676,24 @@ class ARHMM:
                 raise RuntimeError("No params — run fit() first.")
             params = self._params
 
-        group_ids_eff = group_ids if group_ids is not None else self._group_ids
-
         A, Sigma = params['A'], params['Sigma']
         log_pi0  = jnp.log(jnp.array(params['beta']) + 1e-300)
 
+        group_ids = group_ids if group_ids is not None else self._group_ids
+
         if data_list is None:
-            # Use cached prepped (phi, x) pairs — already whitened & lag-expanded.
             if self._prepped_data is None:
                 raise RuntimeError("No data — pass data_list or run fit() first.")
-            prepped      = self._prepped_data
-            use_prepped  = True
+            prepped = self._prepped_data
         else:
             if self.whiten_mode in ('all', 'each') and self.whitening_parameters is not None:
                 data_list = self._whiten_new_data(data_list)
-            prepped     = _prep_data(data_list, self.lag, self.affine)
-            use_prepped = False
+            prepped = _prep_data(data_list, self.lag, self.affine)
 
         total = 0.0
         for i, (phi, x) in enumerate(prepped):
-            g_id  = group_ids_eff[i] if group_ids_eff is not None else None
-            log_A = _get_log_A(params, g_id, self.separate_trans)
+            g_id    = group_ids[i] if group_ids is not None else None
+            log_A   = _get_log_A(params, g_id, self.separate_trans)
 
             if self.robust:
                 log_liks = ar_log_likelihoods_student_t(
@@ -837,6 +849,13 @@ class ARHSMM(ARHMM):
         x_cat      = jnp.concatenate(all_x,    axis=0)
         states_cat = jnp.array(np.concatenate(state_seqs, axis=0))
         stats      = compute_sufficient_stats(phi_cat, x_cat, states_cat, self.K)
+
+        # Regularise stats for numerical stability before IW sampling.
+        # Gated on self._obs_stats is not None to skip the first sweep
+        # (mirrors ARHMM._gibbs_step and moseq2-model's train_model gate).
+        if self._obs_stats is not None:
+            stats = regularize_for_stability(stats, self.obs_prior)
+
         A_new, Sigma_new = sample_obs_params(stats, self.obs_prior, self.rng)
 
         pi_new, beta_new = sample_transitions(
@@ -908,7 +927,24 @@ class ARHSMM(ARHMM):
             results.append(states)
         return results
 
-    def log_likelihood(self, params, data_list, group_ids=None):
+    def log_likelihood(self, params=None, data_list=None, group_ids=None):
+        """Total log marginal likelihood under current HSMM parameters.
+
+        Can be called with no arguments after fit() to use cached params and data.
+
+        Args:
+            params:    Parameter dict.  None → use self._params (requires fit()).
+            data_list: List of raw (T_i, D) arrays.  None → use cached prepped data.
+            group_ids: Unused (ARHSMM does not support separate_trans).
+
+        Returns:
+            Scalar float (sum over all sessions).
+        """
+        if params is None:
+            if self._params is None:
+                raise RuntimeError("No params — run fit() first.")
+            params = self._params
+
         A, Sigma = params['A'], params['Sigma']
         lam      = params['lam']
 
@@ -923,14 +959,17 @@ class ARHSMM(ARHMM):
             jnp.array(lam, dtype=jnp.float32), self.max_dur
         )
 
-        if self.whiten_mode in ('all', 'each') and self.whitening_parameters is not None:
-            data_list = self._whiten_new_data(data_list)
+        if data_list is None:
+            if self._prepped_data is None:
+                raise RuntimeError("No data — pass data_list or run fit() first.")
+            prepped = self._prepped_data
+        else:
+            if self.whiten_mode in ('all', 'each') and self.whitening_parameters is not None:
+                data_list = self._whiten_new_data(data_list)
+            prepped = _prep_data(data_list, self.lag, self.affine)
 
         total = 0.0
-        for data in data_list:
-            phi, x   = make_ar_features(
-                np.array(data, dtype=np.float32), self.lag, affine=self.affine
-            )
+        for phi, x in prepped:
             log_liks = ar_log_likelihoods(
                 jnp.array(phi), jnp.array(x),
                 jnp.array(A), jnp.array(Sigma)
