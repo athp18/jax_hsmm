@@ -410,7 +410,7 @@ class ARHMM:
                 np.array(A), np.array(Sigma),
                 self.nu,
             )
-            tau = np.clip(tau, 0.0, self.nu + self.obs_prior['Psi_0'].shape[0])  # ~nu+D, matches moseq2-model
+            tau = np.where(np.isfinite(tau), tau, 1.0)
             self._dbg("robust tau weights", tau)
             stats = compute_weighted_sufficient_stats(
                 phi_cat, x_cat, states_cat, self.K,
