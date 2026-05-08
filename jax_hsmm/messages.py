@@ -138,20 +138,54 @@ def hmm_expected_states(
     Returns:
         expected_states: (T, K)  Posterior state marginals (rows sum to 1).
     """
-    # Upcast to float64 for the forward-backward pass so that the per-row
-    # normalisation error stays well within 1e-5 for long sequences.
-    # float32 accumulates ~1e-4 error over hundreds of timesteps.
-    log_pi0_64  = log_pi0.astype(jnp.float64)
-    log_A_64    = log_A.astype(jnp.float64)
-    log_liks_64 = log_likelihoods.astype(jnp.float64)
+    # Use a scaled (normalised) forward-backward in probability space.
+    #
+    # Log-space forward-backward accumulates float32 rounding error (~1e-7/step);
+    # over hundreds of timesteps this exceeds the 1e-5 tolerance.  JAX silently
+    # truncates float64→float32 when x64 mode is off, so upcasting doesn't help.
+    # jax.nn.softmax on log_gamma has the same root problem: it still works in
+    # float32 on accumulated log_alpha+log_beta values.
+    #
+    # The scaled algorithm carries normalised O(1) probability vectors.
+    # Dividing alpha_t by its sum at each step keeps mantissa bits on the
+    # significant digits; the scale factors cancel in gamma=alpha*beta/sum,
+    # so we never exponentiate large negative numbers.
 
-    log_alphas = hmm_forward(log_pi0_64, log_A_64, log_liks_64)      # (T, K)
-    log_betas  = hmm_backward_msgs(log_A_64, log_liks_64)             # (T, K)
+    A    = jnp.exp(log_A)             # (K, K) transition probabilities
+    liks = jnp.exp(log_likelihoods)   # (T, K) observation probabilities
+    pi0  = jnp.exp(log_pi0)           # (K,)
 
-    log_gamma = log_alphas + log_betas                                # (T, K)
-    # Normalise each time step.
-    log_gamma -= jax.nn.logsumexp(log_gamma, axis=1, keepdims=True)
-    return jnp.exp(log_gamma).astype(jnp.float32)
+    # --- Scaled forward pass ---
+    def fwd_step(carry, lik_t):
+        alpha_prev, _ = carry
+        alpha_pred = alpha_prev @ A            # (K,)  marginalise from-state
+        alpha_t    = alpha_pred * lik_t        # (K,)  weight by observation
+        c_t        = alpha_t.sum()
+        alpha_t    = alpha_t / jnp.where(c_t > 0, c_t, 1.0)
+        return (alpha_t, c_t), (alpha_t, c_t)
+
+    alpha_0 = pi0 * liks[0]
+    c_0     = alpha_0.sum()
+    alpha_0 = alpha_0 / jnp.where(c_0 > 0, c_0, 1.0)
+
+    _, (alphas_rest, _) = lax.scan(fwd_step, (alpha_0, c_0), liks[1:])
+    alphas = jnp.concatenate([alpha_0[None], alphas_rest], axis=0)  # (T, K)
+
+    # --- Scaled backward pass ---
+    def bwd_step(beta_next, lik_t1):
+        # beta_t[i] = sum_j A[i,j] * lik[t+1,j] * beta[t+1,j]
+        beta_t = (A * lik_t1[None, :] * beta_next[None, :]).sum(axis=1)  # (K,)
+        c_t    = beta_t.sum()
+        beta_t = beta_t / jnp.where(c_t > 0, c_t, 1.0)
+        return beta_t, beta_t
+
+    beta_T   = jnp.ones(log_likelihoods.shape[1])
+    _, betas_rev = lax.scan(bwd_step, beta_T, liks[1:][::-1])
+    betas = jnp.concatenate([betas_rev[::-1], beta_T[None]], axis=0)  # (T, K)
+
+    # Combine and normalise each row to sum to exactly 1.
+    gamma = alphas * betas
+    return gamma / gamma.sum(axis=1, keepdims=True)
 
 
 @jit
