@@ -410,7 +410,7 @@ class ARHMM:
                 np.array(A), np.array(Sigma),
                 self.nu,
             )
-            tau = np.clip(tau, 0.0, 1e4)
+            tau = np.clip(tau, 0.0, self.nu + self.obs_prior['Psi_0'].shape[0])  # ~nu+D, matches moseq2-model
             self._dbg("robust tau weights", tau)
             stats = compute_weighted_sufficient_stats(
                 phi_cat, x_cat, states_cat, self.K,
@@ -507,76 +507,6 @@ class ARHMM:
 
         return params
 
-    def _warm_start_params(self, key, prepped_data, group_ids=None):
-        """Initialise parameters from uniform round-robin state assignments.
-
-        Mirrors pyhsmm's params-first ordering: assign states uniformly across
-        each session, compute sufficient statistics from those assignments, then
-        sample A/Sigma/pi/beta from the data-informed posterior.  This avoids
-        the collapse that results from running FFBS first with random prior
-        parameters.
-
-        chunk_size = max(10, T // K) so each state sees at least ~chunk_size
-        frames before the first FFBS sweep.
-        """
-        K = self.K
-
-        # Build uniform round-robin state sequences for every session.
-        warmup_seqs = []
-        for phi, x in prepped_data:
-            T = phi.shape[0]
-            chunk = max(10, T // K)
-            states = np.array(
-                [t // chunk % K for t in range(T)], dtype=np.int32
-            )
-            warmup_seqs.append(states)
-
-        # Accumulate sufficient statistics from the uniform assignments.
-        # Always use the unweighted version here — no tau weights exist yet.
-        phi_cat    = jnp.concatenate([jnp.array(phi) for phi, _ in prepped_data], axis=0)
-        x_cat      = jnp.concatenate([jnp.array(x)   for _, x   in prepped_data], axis=0)
-        states_cat = jnp.array(np.concatenate(warmup_seqs, axis=0))
-
-        stats = compute_sufficient_stats(phi_cat, x_cat, states_cat, K)
-        stats = regularize_for_stability(stats, self.obs_prior)
-
-        A, Sigma = sample_obs_params(stats, self.obs_prior, self.rng)
-
-        # Sample transition parameters from the warm-start sequences.
-        if self.separate_trans and group_ids is not None:
-            seqs_by_group: dict = {}
-            for seq, g_id in zip(warmup_seqs, group_ids):
-                seqs_by_group.setdefault(g_id, []).append(seq)
-            _, _pi0, beta = init_transitions(
-                K, self.trans_params['alpha'],
-                self.trans_params['kappa'], self.trans_params['gamma'],
-            )
-            pi_groups, beta = sample_transitions_separate(
-                self.rng, seqs_by_group, beta, self.trans_params
-            )
-            pi_pooled = np.mean(list(pi_groups.values()), axis=0)
-            params = dict(
-                A=A, Sigma=Sigma,
-                pi=pi_pooled, pi_groups=pi_groups,
-                beta=beta,
-            )
-        else:
-            _, _pi0, beta = init_transitions(
-                K, self.trans_params['alpha'],
-                self.trans_params['kappa'], self.trans_params['gamma'],
-            )
-            pi, beta = sample_transitions(
-                self.rng, warmup_seqs, beta, self.trans_params
-            )
-            params = dict(A=A, Sigma=Sigma, pi=pi, beta=beta)
-
-        print(f"[warm-start] A range=[{float(np.array(A).min()):.3g}, "
-              f"{float(np.array(A).max()):.3g}]  "
-              f"Sigma range=[{float(np.array(Sigma).min()):.3g}, "
-              f"{float(np.array(Sigma).max()):.3g}]")
-
-        return params
-
     def fit(
         self,
         key,
@@ -628,7 +558,7 @@ class ARHMM:
         prepped = _prep_data(data_list, self.lag, self.affine)
         self._prepped_data = prepped
 
-        params   = self._warm_start_params(key, prepped, group_ids=group_ids)
+        params   = self.init_params(key, data_list, group_ids=group_ids)
         samples  = []
         iter_lls = []
 
