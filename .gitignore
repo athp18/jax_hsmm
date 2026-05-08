@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# JAX / XLA compiled artifacts
+*.ptx
+*.cubin
+jax_cache/
+.jax_cache/
+__pycache__/
+
+# Model outputs
+*.p
+*.pkl
+*.h5
+*.mat
+*.z
+*.arhmm
+checkpoints/
+
+# Training artifacts
+*.png
+train_out.sh
+models/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# SLURM
+*.out
+*.err
+slurm-*.out

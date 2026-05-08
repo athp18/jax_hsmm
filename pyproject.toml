@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jax-hsmm"
+version = "0.1.0"
+description = "JAX implementation of AR-HMM/HSMM for behavioral segmentation"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "jax>=0.4.0",
+    "jaxlib>=0.4.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["jax_hsmm"]
