@@ -307,7 +307,7 @@ def hsmm_forward(
         )
         return log_F_buf_new, log_F_new
 
-    step_jit = jit(step)
+    step_jit = step
     _, log_Fs = lax.scan(step_jit, log_F_buf_init, jnp.arange(T))
     return log_Fs  # (T, K)
 
