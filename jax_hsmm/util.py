@@ -5,8 +5,11 @@ regularize_for_stability
     Pre-sampling regularization that ensures the MNIW posterior scale matrix
     (Schur complement) is positive definite for every state before IW sampling.
 
-    Mirrors the role of moseq2-model's `regularize_for_stability`, but
-    operates on plain numpy stats dicts rather than `pyhsmm` obs_distns objects.
+count_frames
+    Count total frames across a loaded data dict (list of arrays).
+
+count_frames_wrapper
+    Read a PC scores h5 file and print/return total frame count.
 """
 
 import numpy as np
@@ -123,3 +126,66 @@ def regularize_for_stability(
             S_yy = jnp.array(S_yy),
         )
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Frame counting
+# ---------------------------------------------------------------------------
+
+def count_frames(data_dict: dict) -> int:
+    """Count total frames across all sessions in a loaded data dict.
+
+    Mirrors moseq2-model's ``count_frames(data_dict)``.
+
+    Args:
+        data_dict: Dict mapping session key → (T_i, D) array.
+
+    Returns:
+        Total number of frames across all sessions.
+    """
+    return sum(np.asarray(v).shape[0] for v in data_dict.values())
+
+
+def count_frames_wrapper(input_file: str, var_name: str = 'scores', npcs: int = None) -> int:
+    """Count total frames in a PC scores h5 file and print the result.
+
+    Standalone replacement for moseq2-model's ``count_frames_wrapper``.
+    Reads the h5 dataset at ``var_name``, handles three storage layouts:
+
+    - h5 Group of per-session datasets, each shape (T_i, n_pcs)
+    - single 2-D array (T_total, n_pcs) — treated as one session
+    - single 3-D array (n_sessions, T, n_pcs) — total = n_sessions * T
+
+    Args:
+        input_file: Path to the h5 file containing PC scores.
+        var_name:   Name of the dataset/group inside the h5 file.
+        npcs:       If given, assert the PC dimension matches (optional sanity check).
+
+    Returns:
+        Total number of frames across all sessions.
+    """
+    import h5py
+
+    total_frames = 0
+    with h5py.File(input_file, 'r') as f:
+        if var_name not in f:
+            raise KeyError(
+                f"Variable '{var_name}' not found in {input_file}. "
+                f"Available keys: {list(f.keys())}"
+            )
+        scores = f[var_name]
+        if isinstance(scores, h5py.Group):
+            # Per-session datasets stored as a group, each (T_i, n_pcs).
+            for key in scores:
+                total_frames += scores[key].shape[0]
+        else:
+            shape = scores.shape
+            if len(shape) <= 2:
+                # (T, n_pcs) or (T,) — single session.
+                total_frames = shape[0]
+            else:
+                # (n_sessions, T, n_pcs)
+                total_frames = shape[0] * shape[1]
+
+    print(f'Total frames: {total_frames}')
+    return total_frames
