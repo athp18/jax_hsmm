@@ -369,8 +369,40 @@ class TestSeparateTrans:
             )
 
     def test_separate_trans_groups_differ(self):
-        # Two groups should produce different transition matrices
-        _, samples, _ = self._fit_separate(n_sessions=8)
+        # Generate group-specific data with distinct autocorrelation structure
+        # so each group accumulates different transition counts, making their
+        # pi_g matrices differ even under a high-kappa prior.
+        rng = np.random.default_rng(42)
+        n_per_group = 4
+        T = 500
+
+        # ctrl: slow-switching (long runs in each state) — achieved by
+        # drawing from a sticky AR process where x_t ≈ 0.99 * x_{t-1}
+        ctrl_data = []
+        for _ in range(n_per_group):
+            x = np.zeros((T, OBS_DIM), dtype=np.float32)
+            x[0] = rng.standard_normal(OBS_DIM)
+            for t in range(1, T):
+                x[t] = 0.99 * x[t-1] + 0.01 * rng.standard_normal(OBS_DIM)
+            ctrl_data.append(x)
+
+        # ko: fast-switching (short runs, more independent frames)
+        ko_data = []
+        for _ in range(n_per_group):
+            x = np.zeros((T, OBS_DIM), dtype=np.float32)
+            x[0] = rng.standard_normal(OBS_DIM)
+            for t in range(1, T):
+                x[t] = 0.1 * x[t-1] + 0.99 * rng.standard_normal(OBS_DIM)
+            ko_data.append(x)
+
+        data      = ctrl_data + ko_data
+        group_ids = ['ctrl'] * n_per_group + ['ko'] * n_per_group
+
+        model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM, ar_lags=AR_LAGS,
+                      separate_trans=True, seed=6)
+        samples = model.fit(_make_key(6), data, n_iter=N_ITER,
+                            verbose=False, group_ids=group_ids)
+
         pi_ctrl = samples[-1]['pi_groups']['ctrl']
         pi_ko   = samples[-1]['pi_groups']['ko']
         assert not np.allclose(pi_ctrl, pi_ko, atol=1e-3)
