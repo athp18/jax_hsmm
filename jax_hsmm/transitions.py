@@ -230,7 +230,7 @@ def sample_transitions(
     m = sample_crp_table_counts(rng, n, alpha, kappa, beta)
 
     # 3. Update global weights.
-    beta_new = sample_beta(rng, m, gamma)
+    beta_new = sample_beta(rng, m, gamma, alpha=alpha, kappa=kappa, beta=beta)
 
     # 4. Update per-row transition distributions.
     pi_new = sample_pi(rng, n, beta_new, alpha, kappa)
@@ -283,7 +283,7 @@ def sample_transitions_separate(
         all_m += m_g
 
     # Update shared beta from pooled table counts.
-    beta_new = sample_beta(rng, all_m, gamma)
+    beta_new = sample_beta(rng, all_m, gamma, alpha=alpha, kappa=kappa, beta=beta)
 
     # Update per-group pi.
     pi_groups = {
