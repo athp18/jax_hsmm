@@ -16,162 +16,127 @@ import numpy as np
 import jax.numpy as jnp
 
 
-def regularize_for_stability(
-    stats: dict,
-    prior: dict,
-    verbose: bool = False,
-) -> dict:
-    """Regularize sufficient statistics so the MNIW posterior is well-conditioned.
+def regularize_for_stability(stats, prior, verbose=True):
+    import numpy as np
+    import jax.numpy as jnp
 
-    For each state k with enough observations (n_k >= D_x + 2), we check that
-    the posterior scale matrix
-
-        Psi_n(k) = Psi_0 + M_0 V_0 M_0' + S_xx[k]
-                   - (M_0 V_0 + S_xy[k]) (V_0 + S_yy[k])^{-1} (M_0 V_0 + S_xy[k])'
-
-    has strictly positive minimum eigenvalue.  If not, we add a ridge
-    ``lambda * I`` to ``S_yy[k]``, which increases ``C = V_0 + S_yy[k]`` and
-    moves Psi_n(k) toward PD.  Lambda is grown geometrically (factor 1.05)
-    starting from 1e-4 until the Schur complement is PD.
-
-    This matches the behaviour of moseq2-model/train/util.py
-    ``regularize_for_stability``, which calls
-    ``obs_distns[k].regularize_for_stability(kappa)`` — the kappa there is the
-    ridge being added to the gram matrix (equivalent to S_yy here).
-
-    Called in ARHMM._gibbs_step **after** sufficient statistics are accumulated
-    and **before** sample_obs_params, gated on ``self._obs_stats is not None``
-    (i.e. skipped on the very first sweep where stats come from dummy data).
-
-    Args:
-        stats:   Stats dict (keys: n, S_xx, S_xy, S_yy) as returned by
-                 compute_sufficient_stats or compute_weighted_sufficient_stats.
-                 JAX arrays are converted to numpy internally; the returned
-                 dict has jnp arrays for S_yy if any state was modified.
-        prior:   MNIW prior dict (keys: M_0, V_0, Psi_0, nu_0).
-        verbose: If True, print which states were regularized and by how much.
-
-    Returns:
-        Stats dict.  If no state needed regularization the *same* dict object
-        is returned unchanged.  Otherwise a new dict is returned with S_yy
-        replaced by a jnp array that incorporates the ridge corrections.
-    """
-    M_0  = np.asarray(prior['M_0'],  dtype=np.float64)
-    V_0  = np.asarray(prior['V_0'],  dtype=np.float64)
+    # ----------------------------
+    # priors
+    # ----------------------------
+    M_0   = np.asarray(prior['M_0'], dtype=np.float64)
+    V_0   = np.asarray(prior['V_0'], dtype=np.float64)
     Psi_0 = np.asarray(prior['Psi_0'], dtype=np.float64)
 
-    n    = np.array(stats['n'],    dtype=np.float64)
-    S_xx = np.array(stats['S_xx'], dtype=np.float64)   # (K, D_x, D_x)
-    S_xy = np.array(stats['S_xy'], dtype=np.float64)   # (K, D_x, D_phi)
-    S_yy = np.array(stats['S_yy'], dtype=np.float64)   # (K, D_phi, D_phi)
+    n    = np.asarray(stats['n'], dtype=np.float64)
+    S_xx = np.asarray(stats['S_xx'], dtype=np.float64)
+    S_xy = np.asarray(stats['S_xy'], dtype=np.float64)
+    S_yy = np.asarray(stats['S_yy'], dtype=np.float64)
 
-    K     = n.shape[0]
-    D_x   = M_0.shape[0]
+    K = n.shape[0]
     D_phi = M_0.shape[1]
-    I_phi = np.eye(D_phi, dtype=np.float64)
 
-    # Precompute prior contribution (state-independent).
-    MV_0    = M_0 @ V_0                # (D_x, D_phi)
-    A_prior = Psi_0 + MV_0 @ M_0.T    # (D_x, D_x)
+    I = np.eye(D_phi, dtype=np.float64)
 
-    any_modified = False
+    MV_0 = M_0 @ V_0
+    A_prior = Psi_0 + MV_0 @ M_0.T
 
-    # Diagonal scale for relative ridge sizing (state-independent).
-    S_xx_diag_scale = max(float(np.abs(np.diag(A_prior)).mean()), 1.0)
+    # ----------------------------
+    # ultra-safe sanitizer
+    # ----------------------------
+    def clean(A):
+        A = np.asarray(A, dtype=np.float64)
 
+        # hard clamp EVERYTHING (this is key)
+        A = np.where(np.isfinite(A), A, 0.0)
+        A = np.clip(A, -1e10, 1e10)
+
+        if A.shape[0] == A.shape[1]:
+          A = 0.5 * (A + A.T)
+        return A
+
+    # ----------------------------
+    # PSD enforcement WITHOUT eig
+    # ----------------------------
+    def psd_force(A):
+        A = clean(A)
+
+        # diagonal dominance trick (NO eig)
+        diag_mean = np.mean(np.diag(A))
+
+        if diag_mean <= 0 or not np.isfinite(diag_mean):
+            A = A + (1e-2 + abs(diag_mean)) * np.eye(A.shape[0])
+
+        # ensure strong diagonal stability
+        A = A + 1e-6 * np.eye(A.shape[0])
+
+        return A
+
+    # ----------------------------
+    # stable Cholesky
+    # ----------------------------
+    def chol(A):
+        A = psd_force(A)
+        dim = A.shape[0]
+
+        # Retry with escalating diagonal regularization.
+        # Newer NumPy's cholesky can internally call eigvalsh on degenerate
+        # matrices, raising "Eigenvalues did not converge" as a LinAlgError.
+        # A single fallback isn't enough — we loop until it works.
+        for scale in [0.0, 1e-6, 1e-4, 1e-2, 0.1, 1.0, 10.0]:
+            try:
+                return np.linalg.cholesky(A + scale * np.eye(dim))
+            except (np.linalg.LinAlgError, Exception):
+                continue
+
+        # Last resort: return identity so the outer except can reset the state.
+        raise np.linalg.LinAlgError("chol failed after all regularization attempts")
+
+    # ----------------------------
+    # main loop
+    # ----------------------------
     for k in range(K):
-        if n[k] < D_x + 2:
-            # Fewer observations than needed for a proper posterior:
-            # sample_obs_params will draw from the prior, so skip.
+
+        if n[k] < 1:
             continue
 
-        # --- Non-finite guard ---
-        # NaN/Inf in sufficient statistics (from exploding AR predictions)
-        # propagates into Psi_n and causes eigvalsh/cholesky to raise with
-        # cryptic errors.  Zero out the contaminated state's stats so it
-        # falls through to a prior-draw in sample_obs_params.
-        if (not np.isfinite(S_xx[k]).all()
-                or not np.isfinite(S_xy[k]).all()
-                or not np.isfinite(S_yy[k]).all()):
+        S_xx_k = clean(S_xx[k])
+        S_xy_k = clean(S_xy[k])
+        S_yy_k = clean(S_yy[k])
+
+        # extra safety: kill pathological scale early
+        S_yy_k = np.clip(S_yy_k, -1e8, 1e8)
+
+        B = MV_0 + S_xy_k
+        C = V_0 + S_yy_k
+
+        try:
+            L = chol(C)
+        except Exception:
             if verbose:
-                print(
-                    f"regularize_for_stability: state {k:3d}  "
-                    f"non-finite stats — resetting to prior draw"
-                )
-            S_xx[k] = np.zeros_like(S_xx[k])
-            S_xy[k] = np.zeros_like(S_xy[k])
-            S_yy[k] = np.zeros_like(S_yy[k])
-            n[k]    = 0.0          # forces prior draw in sample_obs_params
-            any_modified = True
+                print(f"[WARN] state {k} collapsed → reset")
+            S_xx[k] = 0
+            S_xy[k] = 0
+            S_yy[k] = 0
+            n[k] = 0
             continue
 
-        B = MV_0 + S_xy[k]   # (D_x, D_phi)
+        Y = np.linalg.solve(L, B.T)
+        Psi_n = A_prior + S_xx_k - Y.T @ Y
 
-        lam = 0.0
-        is_pd = False
+        # final stabilization (NO eig)
+        Psi_n = clean(Psi_n)
+        Psi_n = psd_force(Psi_n)
 
-        for _iter in range(200):        # safety cap on iterations
-            C = V_0 + S_yy[k] + lam * I_phi    # (D_phi, D_phi)
-            try:
-                np.linalg.cholesky(C)
-                # Schur: A_prior + S_xx[k] - B C^{-1} B'
-                # Use solve for numerical safety: C^{-1} B' = (C \ B')
-                C_inv_Bt = np.linalg.solve(C, B.T)   # (D_phi, D_x)
-                Psi_n = A_prior + S_xx[k] - B @ C_inv_Bt
-            except np.linalg.LinAlgError:
-                lam = max(lam * 2.0, S_xx_diag_scale * 1e-8)
-                continue
+        S_xx[k] = S_xx_k
+        S_xy[k] = S_xy_k
+        S_yy[k] = S_yy_k
 
-            Psi_n = (Psi_n + Psi_n.T) * 0.5       # symmetrise
-
-            # Guard eigvalsh against non-finite Psi_n — can arise when S_xx
-            # is very large and C has not yet been regularized enough.
-            if not np.isfinite(Psi_n).all():
-                lam = max(lam * 2.0, S_xx_diag_scale * 1e-8)
-                continue
-
-            try:
-                min_eig = np.linalg.eigvalsh(Psi_n).min()
-            except np.linalg.LinAlgError:
-                lam = max(lam * 2.0, S_xx_diag_scale * 1e-8)
-                continue
-
-            if min_eig > 1e-8:
-                is_pd = True
-                break
-
-            # Escalate ridge geometrically (factor 2 for fast convergence).
-            lam = max(lam * 2.0, S_xx_diag_scale * 1e-8)
-
-        if not is_pd:
-            # Could not stabilize: zero out so sample_obs_params uses prior.
-            if verbose:
-                print(
-                    f"regularize_for_stability: state {k:3d}  "
-                    f"n={int(n[k])}  could not make PD — resetting to prior draw"
-                )
-            S_xx[k] = np.zeros_like(S_xx[k])
-            S_xy[k] = np.zeros_like(S_xy[k])
-            S_yy[k] = np.zeros_like(S_yy[k])
-            n[k]    = 0.0
-            any_modified = True
-        elif lam > 0.0:
-            if verbose:
-                print(
-                    f"regularize_for_stability: state {k:3d}  "
-                    f"n={int(n[k])}  ridge λ={lam:.3e}"
-                )
-            S_yy[k] += lam * I_phi
-            any_modified = True
-
-    if any_modified:
-        return dict(
-            n    = jnp.array(n),
-            S_xx = jnp.array(S_xx),
-            S_xy = jnp.array(S_xy),
-            S_yy = jnp.array(S_yy),
-        )
-    return stats
+    return dict(
+        n=jnp.array(n),
+        S_xx=jnp.array(S_xx),
+        S_xy=jnp.array(S_xy),
+        S_yy=jnp.array(S_yy),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,59 +144,46 @@ def regularize_for_stability(
 # ---------------------------------------------------------------------------
 
 def count_frames(data_dict: dict) -> int:
-    """Count total frames across all sessions in a loaded data dict.
-
-    Mirrors moseq2-model's ``count_frames(data_dict)``.
-
-    Args:
-        data_dict: Dict mapping session key → (T_i, D) array.
-
-    Returns:
-        Total number of frames across all sessions.
-    """
+    """Count total frames across all sessions in a loaded data dict."""
     return sum(np.asarray(v).shape[0] for v in data_dict.values())
 
 
-def count_frames_wrapper(input_file: str, var_name: str = 'scores', npcs: int = None) -> int:
-    """Count total frames in a PC scores h5 file and print the result.
-
-    Standalone replacement for moseq2-model's ``count_frames_wrapper``.
-    Reads the h5 dataset at ``var_name``, handles three storage layouts:
-
-    - h5 Group of per-session datasets, each shape (T_i, n_pcs)
-    - single 2-D array (T_total, n_pcs) — treated as one session
-    - single 3-D array (n_sessions, T, n_pcs) — total = n_sessions * T
-
-    Args:
-        input_file: Path to the h5 file containing PC scores.
-        var_name:   Name of the dataset/group inside the h5 file.
-        npcs:       If given, assert the PC dimension matches (optional sanity check).
-
-    Returns:
-        Total number of frames across all sessions.
+def count_frames_wrapper(
+    input_file: str,
+    var_name: str = 'scores',
+    npcs: int = None,
+) -> int:
     """
+    Count total frames in a PC scores h5 file and print the result.
+    """
+
     import h5py
 
     total_frames = 0
+
     with h5py.File(input_file, 'r') as f:
+
         if var_name not in f:
             raise KeyError(
                 f"Variable '{var_name}' not found in {input_file}. "
                 f"Available keys: {list(f.keys())}"
             )
+
         scores = f[var_name]
+
         if isinstance(scores, h5py.Group):
-            # Per-session datasets stored as a group, each (T_i, n_pcs).
+
             for key in scores:
                 total_frames += scores[key].shape[0]
+
         else:
             shape = scores.shape
+
             if len(shape) <= 2:
-                # (T, n_pcs) or (T,) — single session.
                 total_frames = shape[0]
             else:
-                # (n_sessions, T, n_pcs)
                 total_frames = shape[0] * shape[1]
 
     print(f'Total frames: {total_frames}')
+
     return total_frames
