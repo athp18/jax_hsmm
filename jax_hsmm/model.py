@@ -35,6 +35,8 @@ Usage
                            group_ids=['ctrl', 'ctrl', 'ko', 'ko'])
 """
 
+import os
+import pickle
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -83,30 +85,45 @@ def whiten_data(data_list):
     Mirrors moseq2-model's ``whiten_all``.
 
     Returns:
-        whitened:  List of (T_i, D) float32 whitened arrays.
-        mean:      (D,) global mean.
-        L_inv:     (D, D) inverse Cholesky factor (L_inv = L^{-1} where cov = L L^T).
-                   Undo with: x_orig = x_white @ L_inv^{-T} + mean
+        whitened:          List of (T_i, D) float32 whitened arrays.
+        whitening_params:  Dict with keys 'mu', 'L', 'offset'.
     """
     all_data = np.concatenate(
         [np.asarray(d, dtype=np.float64) for d in data_list], axis=0
     )
-    mean    = all_data.mean(axis=0)
-    centred = all_data - mean
-    cov     = (centred.T @ centred) / len(centred)
+    mu  = all_data.mean(axis=0)
+    cov = np.cov(all_data, rowvar=False, bias=True)
 
     min_eig = np.linalg.eigvalsh(cov).min()
     if min_eig < 1e-8:
         cov += (1e-8 - min_eig) * np.eye(cov.shape[0])
 
-    L     = np.linalg.cholesky(cov)
-    L_inv = np.linalg.solve(L, np.eye(L.shape[0]))
+    L      = np.linalg.cholesky(cov)
+    offset = 0.0
 
-    whitened = [
-        ((np.asarray(d, dtype=np.float64) - mean) @ L_inv.T).astype(np.float32)
-        for d in data_list
-    ]
-    return whitened, mean, L_inv
+    def _apply(d):
+        return np.linalg.solve(L, (np.asarray(d, np.float64) - mu).T).T + offset
+
+    whitened = [_apply(d).astype(np.float32) for d in data_list]
+    return whitened, {'mu': mu, 'L': L, 'offset': offset}
+
+
+def whiten_data_each(data_list):
+    """Cholesky-whiten each session independently.
+
+    Mirrors moseq2-model's ``whiten_each``.
+
+    Returns:
+        whitened:          List of (T_i, D) float32 whitened arrays.
+        whitening_params:  Dict mapping session index -> {'mu', 'L', 'offset'}.
+    """
+    whitened         = []
+    whitening_params = {}
+    for i, d in enumerate(data_list):
+        w_list, wp = whiten_data([d])
+        whitened.append(w_list[0])
+        whitening_params[i] = wp
+    return whitened, whitening_params
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +200,7 @@ class ARHMM:
         kappa: float         = 1e6,
         gamma: float         = 999.0,
         affine: bool         = True,
-        whiten: bool         = True,
+        whiten: str          = 'all',
         empirical_bayes: bool = True,
         separate_trans: bool = False,
         robust: bool         = False,
@@ -195,27 +212,19 @@ class ARHMM:
         self.lag             = ar_lags
         self.nlags           = ar_lags
         self.affine          = affine
-        self.whiten          = whiten
+        self.whiten_mode     = (whiten or 'none').lower()
         self.empirical_bayes = empirical_bayes
         self.separate_trans  = separate_trans
         self.robust          = robust
         self.nu              = nu
         self.rng             = np.random.default_rng(seed)
 
-        self.whiten_mean  = None
-        self.whiten_L_inv = None
+        self.whitening_parameters = None  # set during fit(); dict for 'all', dict-of-dicts for 'each'
 
         self.obs_prior = default_mniw_prior(obs_dim, ar_lags, affine=affine)
 
-        # When separate_trans=True, each group gets its own pi_g sampled from
-        # Dir(alpha*beta + kappa*e_k + n_g[k,:]).  With kappa=1e6 the diagonal
-        # concentration is 1e6 vs ~0.1 off-diagonal regardless of group counts,
-        # so all groups produce indistinguishable near-identity matrices.
-        # Cap kappa at 100 for separate_trans so group-specific transition
-        # structure can actually emerge from the data.
-        effective_kappa = min(kappa, 100.0) if separate_trans else kappa
         self.trans_params, _pi0, _beta0 = init_transitions(
-            n_states, alpha, effective_kappa, gamma
+            n_states, alpha, kappa, gamma
         )
 
         # State / stat storage updated after every Gibbs sweep.
@@ -231,27 +240,64 @@ class ARHMM:
     # ------------------------------------------------------------------
 
     def _apply_whitening(self, data_list):
-        whitened, mean, L_inv = whiten_data(data_list)
-        self.whiten_mean  = mean
-        self.whiten_L_inv = L_inv
+        if self.whiten_mode == 'all':
+            whitened, wp = whiten_data(data_list)
+            self.whitening_parameters = wp
+        elif self.whiten_mode == 'each':
+            whitened, wp = whiten_data_each(data_list)
+            self.whitening_parameters = wp
+        else:
+            whitened = data_list
+            self.whitening_parameters = None
         return whitened
 
     def _whiten_new_data(self, data_list):
-        """Apply the stored whitening transform to new data."""
-        if self.whiten_mean is None:
-            return data_list
-        return [
-            ((np.asarray(d, dtype=np.float64) - self.whiten_mean)
-             @ self.whiten_L_inv.T).astype(np.float32)
-            for d in data_list
-        ]
+        """Apply stored whitening to new data.
 
-    def unwhiten(self, data):
-        """Invert the whitening transform on a (T, D) array."""
-        if self.whiten_mean is None:
+        For 'each' mode applied to genuinely new sessions (not in the stored
+        per-session index), falls back to session 0's params — same behaviour
+        as moseq2-model's apply_model which always uses a single stored dict.
+        """
+        if self.whitening_parameters is None:
+            return data_list
+        if self.whiten_mode == 'all':
+            wp = self.whitening_parameters
+            mu, L, offset = wp['mu'], wp['L'], wp['offset']
+            return [
+                (np.linalg.solve(L, (np.asarray(d, np.float64) - mu).T).T
+                 + offset).astype(np.float32)
+                for d in data_list
+            ]
+        elif self.whiten_mode == 'each':
+            result = []
+            fallback = self.whitening_parameters[0]
+            for i, d in enumerate(data_list):
+                wp = self.whitening_parameters.get(i, fallback)
+                mu, L, offset = wp['mu'], wp['L'], wp['offset']
+                result.append(
+                    (np.linalg.solve(L, (np.asarray(d, np.float64) - mu).T).T
+                     + offset).astype(np.float32)
+                )
+            return result
+        return data_list
+
+    def unwhiten(self, data, session_idx=None):
+        """Invert the whitening transform on a (T, D) array.
+
+        Args:
+            data:        (T, D) whitened array.
+            session_idx: For whiten='each', the original session index.
+        """
+        if self.whitening_parameters is None:
             return data
-        L = np.linalg.solve(self.whiten_L_inv, np.eye(self.D))
-        return np.asarray(data, dtype=np.float64) @ L.T + self.whiten_mean
+        if self.whiten_mode == 'all':
+            wp = self.whitening_parameters
+        elif self.whiten_mode == 'each':
+            wp = self.whitening_parameters.get(session_idx or 0)
+        else:
+            return data
+        mu, L = wp['mu'], wp['L']
+        return (np.asarray(data, np.float64) @ L.T) + mu
 
     # ------------------------------------------------------------------
     # Core Gibbs step
@@ -408,17 +454,21 @@ class ARHMM:
         verbose=True,
         store_every=1,
         group_ids=None,
+        checkpoint_freq=None,
+        checkpoint_path=None,
     ):
         """Run the Gibbs sampler.
 
         Args:
-            key:        JAX PRNGKey.
-            data_list:  List of (T_i, obs_dim) float32 arrays.
-            n_iter:     Number of Gibbs iterations.
-            verbose:    Show tqdm progress bar.
-            store_every: Store a snapshot every this many iterations.
-            group_ids:  List of group labels, one per session.  Required when
-                        separate_trans=True.  Labels can be any hashable.
+            key:             JAX PRNGKey.
+            data_list:       List of (T_i, obs_dim) float32 arrays.
+            n_iter:          Number of Gibbs iterations.
+            verbose:         Show tqdm progress bar.
+            store_every:     Store a snapshot every this many iterations.
+            group_ids:       List of group labels, one per session.  Required when
+                             separate_trans=True.  Labels can be any hashable.
+            checkpoint_freq: Save a checkpoint every N iterations (None to disable).
+            checkpoint_path: Directory to write checkpoint files into.
 
         Returns:
             samples: List of parameter dicts (one per stored iteration).
@@ -431,7 +481,7 @@ class ARHMM:
 
         self._group_ids = group_ids
 
-        if self.whiten:
+        if self.whiten_mode in ('all', 'each'):
             data_list = self._apply_whitening(data_list)
 
         if self.empirical_bayes:
@@ -445,6 +495,9 @@ class ARHMM:
         params  = self.init_params(key, data_list, group_ids=group_ids)
         samples = []
 
+        if checkpoint_freq is not None and checkpoint_path is not None:
+            os.makedirs(checkpoint_path, exist_ok=True)
+
         for i in tqdm(range(n_iter), disable=not verbose, desc='Gibbs'):
             key, subkey = jax.random.split(key)
             params, _ = self._gibbs_step(
@@ -453,7 +506,49 @@ class ARHMM:
             if (i + 1) % store_every == 0:
                 samples.append(_store_params(params))
 
+            if (checkpoint_freq is not None
+                    and checkpoint_path is not None
+                    and (i + 1) % checkpoint_freq == 0):
+                self._save_checkpoint(i + 1, params, samples, checkpoint_path)
+
         return samples
+
+    def _save_checkpoint(self, itr, params, samples, checkpoint_path):
+        """Save a checkpoint to disk.
+
+        Format mirrors moseq2-model's save_arhmm_checkpoint:
+            iter, model, params, samples, log_likelihood, labels.
+        """
+        checkpoint = {
+            'iter':           itr,
+            'model':          self,
+            'params':         _store_params(params),
+            'samples':        samples,
+            'log_likelihood': self.log_likelihood(),
+            'labels':         self.get_labels(),
+        }
+        fname = os.path.join(checkpoint_path, f'checkpoint_{itr}.pkl')
+        with open(fname, 'wb') as f:
+            pickle.dump(checkpoint, f)
+        print(f'Checkpoint saved: {fname}')
+
+    @classmethod
+    def load_checkpoint(cls, checkpoint_file):
+        """Load a checkpoint saved by fit().
+
+        Returns:
+            (model, samples, itr): fully restored model, stored snapshots,
+            and the iteration number at save time.
+
+        To resume::
+
+            model, samples, itr = ARHMM.load_checkpoint('checkpoints/checkpoint_100.pkl')
+            samples += model.fit(key, data_list, n_iter=100)
+        """
+        with open(checkpoint_file, 'rb') as f:
+            checkpoint = pickle.load(f)
+        return checkpoint['model'], checkpoint['samples'], checkpoint['iter']
+
 
     def viterbi(self, params, data_list, group_ids=None):
         """MAP state sequences via Viterbi decoding.
@@ -470,7 +565,7 @@ class ARHMM:
         A, Sigma = params['A'], params['Sigma']
         log_pi0  = jnp.log(jnp.array(params['beta']) + 1e-300)
 
-        if self.whiten and self.whiten_mean is not None:
+        if self.whiten_mode in ('all', 'each') and self.whitening_parameters is not None:
             data_list = self._whiten_new_data(data_list)
 
         results = []
@@ -520,7 +615,7 @@ class ARHMM:
                 raise RuntimeError("No data — pass data_list explicitly.")
             prepped = self._prepped_data
         else:
-            if self.whiten and self.whiten_mean is not None:
+            if self.whiten_mode in ('all', 'each') and self.whitening_parameters is not None:
                 data_list = self._whiten_new_data(data_list)
             prepped = _prep_data(data_list, self.lag, self.affine)
 
@@ -578,7 +673,7 @@ class ARHMM:
             prepped      = self._prepped_data
             use_prepped  = True
         else:
-            if self.whiten and self.whiten_mean is not None:
+            if self.whiten_mode in ('all', 'each') and self.whitening_parameters is not None:
                 data_list = self._whiten_new_data(data_list)
             prepped     = _prep_data(data_list, self.lag, self.affine)
             use_prepped = False
@@ -689,7 +784,7 @@ class ARHSMM(ARHMM):
         kappa: float          = 1e6,
         gamma: float          = 999.0,
         affine: bool          = True,
-        whiten: bool          = True,
+        whiten: str           = 'all',
         empirical_bayes: bool = True,
         max_dur: int          = 100,
         expected_dur: float   = 20.0,
@@ -794,7 +889,7 @@ class ARHSMM(ARHMM):
             jnp.array(lam, dtype=jnp.float32), self.max_dur
         )
 
-        if self.whiten and self.whiten_mean is not None:
+        if self.whiten_mode in ('all', 'each') and self.whitening_parameters is not None:
             data_list = self._whiten_new_data(data_list)
 
         results = []
@@ -828,7 +923,7 @@ class ARHSMM(ARHMM):
             jnp.array(lam, dtype=jnp.float32), self.max_dur
         )
 
-        if self.whiten and self.whiten_mean is not None:
+        if self.whiten_mode in ('all', 'each') and self.whitening_parameters is not None:
             data_list = self._whiten_new_data(data_list)
 
         total = 0.0
