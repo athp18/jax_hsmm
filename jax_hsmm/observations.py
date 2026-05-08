@@ -384,7 +384,7 @@ def sample_obs_params(
             # Regularisation safety check: Psi_n must be PD for IW sampling.
             min_eig = np.linalg.eigvalsh(Psi_n).min()
             if min_eig < 1e-8:
-                Psi_n += (1e-6 - min_eig) * np.eye(D_x)
+                Psi_n += (1e-6 - min_eig + 0.01 * np.abs(np.diag(Psi_n)).mean()) * np.eye(D_x)
 
             # Sample Sigma_k ~ IW(Psi_n, nu_n).
             Sigma_k = invwishart.rvs(df=int(nu_n), scale=Psi_n, random_state=rng)
