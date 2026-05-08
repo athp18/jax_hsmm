@@ -335,12 +335,29 @@ def sample_obs_params(
         else:
             # Posterior MNIW update.
             V_n = np.array(V_0 + S_yy[k], dtype=np.float64)
-            # Symmetrise and ridge before Cholesky — S_yy[k] comes from JAX
-            # float32 and can introduce tiny asymmetries / negative eigenvalues.
+            # Symmetrise — S_yy[k] comes from JAX float32 and can introduce
+            # tiny asymmetries.
             V_n = (V_n + V_n.T) * 0.5
-            ridge = np.abs(np.diag(V_n)).mean() * 1e-8
-            V_n += ridge * np.eye(D_phi)
-            V_n_chol = np.linalg.cholesky(V_n)
+
+            # Robust Cholesky: escalate ridge geometrically until V_n is PD.
+            # Starting ridge is relative to the diagonal scale so it adapts
+            # to matrices with large (many-frame) or small entries.
+            diag_scale = max(float(np.abs(np.diag(V_n)).mean()), 1.0)
+            lam_v = 0.0
+            V_n_chol = None
+            for _v_iter in range(200):
+                try:
+                    V_n_chol = np.linalg.cholesky(V_n + lam_v * np.eye(D_phi))
+                    if lam_v > 0.0:
+                        V_n = V_n + lam_v * np.eye(D_phi)
+                    break
+                except np.linalg.LinAlgError:
+                    lam_v = max(lam_v * 2.0, diag_scale * 1e-8)
+            if V_n_chol is None:
+                # Extreme fallback: use prior precision only.
+                V_n = np.array(V_0, dtype=np.float64)
+                V_n_chol = np.linalg.cholesky(V_n)
+
             M_n = np.linalg.solve(V_n, (S_xy[k] + M_0 @ V_0).T).T
 
             nu_n  = nu_0 + n_k
@@ -351,9 +368,20 @@ def sample_obs_params(
             # Symmetrise for numerical stability.
             Psi_n = (Psi_n + Psi_n.T) * 0.5
 
-            # ---- Regularisation safety check (mirrors regularize_for_stability) ----
-            # Psi_n must be positive definite for IW sampling.  Add a small ridge
-            # if the minimum eigenvalue is non-positive.
+            # If Psi_n contains non-finite values (NaN/Inf from exploding
+            # sufficient statistics that slipped past regularize_for_stability),
+            # fall back to a prior draw for this state.
+            if not np.isfinite(Psi_n).all():
+                Sigma_k = invwishart.rvs(df=int(nu_0), scale=Psi_0, random_state=rng)
+                L_S = np.linalg.cholesky(Sigma_k)
+                L_V = np.linalg.cholesky(np.linalg.inv(V_0))
+                Z   = rng.standard_normal((D_x, D_phi))
+                A_k = M_0 + L_S @ Z @ L_V.T
+                A_all[k]     = A_k
+                Sigma_all[k] = Sigma_k
+                continue
+
+            # Regularisation safety check: Psi_n must be PD for IW sampling.
             min_eig = np.linalg.eigvalsh(Psi_n).min()
             if min_eig < 1e-8:
                 Psi_n += (1e-6 - min_eig) * np.eye(D_x)
