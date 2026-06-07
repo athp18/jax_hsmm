@@ -50,6 +50,7 @@ from jax_hsmm.messages import (
     hmm_viterbi,
     hsmm_forward,
     hsmm_backward_sample,
+    hsmm_viterbi,
 )
 from jax_hsmm.observations import (
     make_ar_features,
@@ -178,8 +179,9 @@ class ARHMM:
     obs_dim : int
     ar_lags : int
     alpha : float          HDP row concentration.
-    kappa : float          Stickiness (self-transition) bonus. Default 1e6
-                           matches moseq2-model.
+    kappa : float or None  Stickiness (self-transition) bonus.  None (default)
+                           sets kappa = total training frames at fit() time,
+                           matching moseq2-model's default behaviour.
     gamma : float          HDP top-level concentration.
     affine : bool          Append bias column to phi.
     whiten : bool          Cholesky-whiten data before fitting.
@@ -197,7 +199,7 @@ class ARHMM:
         obs_dim: int         = 10,
         ar_lags: int         = 3,
         alpha: float         = 5.7,
-        kappa: float         = 1e6,
+        kappa                = None,
         gamma: float         = 999.0,
         affine: bool         = True,
         whiten: str          = 'all',
@@ -226,9 +228,12 @@ class ARHMM:
 
         self.obs_prior = default_mniw_prior(obs_dim, ar_lags, affine=affine)
 
+        # kappa=None → defer to fit(); use a placeholder of 1.0 for init.
         self.trans_params, _pi0, _beta0 = init_transitions(
-            n_states, alpha, kappa, gamma
+            n_states, alpha, kappa if kappa is not None else 1.0, gamma
         )
+        # Store None so fit() knows to compute kappa from total frames.
+        self.trans_params['kappa'] = kappa
 
         # State / stat storage updated after every Gibbs sweep.
         self.state_seqs      = None
@@ -238,8 +243,8 @@ class ARHMM:
         self._group_ids      = None
         self.expected_states = None
 
-        # Set to True to print per-step diagnostics inside _gibbs_step.
-        self.debug = True
+        # Set to True to print per-step NaN/Inf diagnostics inside _gibbs_step.
+        self.debug = False
         self._gibbs_iter = 0   # incremented each sweep for log prefixes
 
     # ------------------------------------------------------------------
@@ -550,6 +555,11 @@ class ARHMM:
         if self.whiten_mode in ('all', 'each'):
             data_list = self._apply_whitening(data_list)
 
+        # Resolve kappa: if None, set to total training frames (moseq2-model default).
+        if self.trans_params['kappa'] is None:
+            total_frames = sum(d.shape[0] for d in data_list)
+            self.trans_params['kappa'] = float(total_frames)
+
         if self.empirical_bayes:
             self.obs_prior = empirical_bayes_mniw_prior(
                 data_list, self.D, self.lag, affine=self.affine
@@ -851,7 +861,7 @@ class ARHSMM(ARHMM):
         obs_dim: int          = 10,
         ar_lags: int          = 3,
         alpha: float          = 5.7,
-        kappa: float          = 1e6,
+        kappa                 = None,
         gamma: float          = 999.0,
         affine: bool          = True,
         whiten: str           = 'all',
@@ -938,18 +948,18 @@ class ARHSMM(ARHMM):
         return params
 
     def viterbi(self, params, data_list, group_ids=None):
-        """Approximate MAP state sequence for HSMM via forward-message argmax.
+        """MAP state sequence for HSMM via true max-product Viterbi.
 
-        .. warning::
-            This is a **filtered estimate**, not a true MAP sequence.
-            ``states[t] = argmax_k log_F[t, k]`` selects the most likely state
-            at each time step given *all past observations*, but it does not
-            account for future observations or the duration model during the
-            backward pass.  A proper HSMM MAP decode requires an HSMM Viterbi
-            algorithm (O(T * D * K²)) which is not yet implemented.
+        Uses the full HSMM Viterbi algorithm (O(T·D·K²)) with duration
+        backpointers, equivalent to pyhsmm's ``hsmm_maximizing_assignment``.
 
-            For sampling-based MAP use the posterior mode of the Gibbs chain
-            (e.g. the last sample) and call ``model.state_seqs`` directly.
+        Args:
+            params:    Parameter dict (e.g. samples[-1] from fit()).
+            data_list: List of (T_i, obs_dim) arrays (raw).
+            group_ids: Unused (ARHSMM does not support separate_trans).
+
+        Returns:
+            List of (T_i - lag,) integer numpy arrays.
         """
         A, Sigma = params['A'], params['Sigma']
         lam      = params['lam']
@@ -977,10 +987,9 @@ class ARHSMM(ARHMM):
                 jnp.array(phi), jnp.array(x),
                 jnp.array(A), jnp.array(Sigma)
             )
-            log_F  = hsmm_forward(log_pi0, log_A, log_dur, log_liks, self.max_dur)
-            # Filtered-estimate approximation: argmax over states at each frame.
-            # NOTE: not the true MAP sequence; see docstring above.
-            states = np.argmax(np.array(log_F), axis=1)
+            states = hsmm_viterbi(
+                log_pi0, log_A, log_dur, log_liks, self.max_dur
+            )
             results.append(states)
         return results
 

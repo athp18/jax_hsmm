@@ -386,10 +386,18 @@ def sample_obs_params(
                 Sigma_all[k] = Sigma_k
                 continue
 
-            # Regularisation safety check: Psi_n must be PD for IW sampling.
-            min_eig = np.linalg.eigvalsh(Psi_n).min()
-            if min_eig < 1e-8:
-                Psi_n += (1e-6 - min_eig + 0.01 * np.abs(np.diag(Psi_n)).mean()) * np.eye(D_x)
+            # Ensure Psi_n is PD for IW sampling.  Use the same fine-grained
+            # geometric ridge search as moseq2-model's
+            # minimum_regularization_coefficient (start=1e-4, step *=1.05)
+            # rather than a one-shot guess, so we find the minimum ridge needed.
+            if np.linalg.eigvalsh(Psi_n).min() < 1e-8:
+                ridge = 1e-4
+                I_x   = np.eye(D_x)
+                for _ in range(10_000):
+                    if np.linalg.eigvalsh(Psi_n + ridge * I_x).min() > 0:
+                        break
+                    ridge *= 1.05
+                Psi_n = Psi_n + ridge * I_x
 
             # Sample Sigma_k ~ IW(Psi_n, nu_n).
             Sigma_k = invwishart.rvs(df=int(nu_n), scale=Psi_n, random_state=rng)
@@ -435,11 +443,10 @@ def default_mniw_prior(obs_dim: int, ar_lags: int, affine: bool = False) -> dict
 
     return dict(
         M_0   = M_0,
-        V_0   = 10.0 * np.eye(D_phi),   # matches moseq2-model K_0_scale=10.0
+        # V_0 is the prior *precision* on A's rows (= K_0^{-1} in pybasicbayes).
+        # pybasicbayes uses K_0 = K_0_scale * I = 10·I, so K_0^{-1} = 0.1·I.
+        V_0   = 0.1 * np.eye(D_phi),
         Psi_0 = np.eye(D) * 0.01,        # matches moseq2-model S_0_scale=0.01
-                                          # E[Sigma]=Psi_0/(nu_0-D-1)=0.01*I; keeps
-                                          # prior draws tight so low-count states
-                                          # don't steal frames via inflated likelihoods
         nu_0  = float(D + 2),
     )
 
@@ -525,7 +532,7 @@ def empirical_bayes_mniw_prior(
 
     return dict(
         M_0   = M_0,
-        V_0   = 10.0 * np.eye(D_phi, dtype=np.float64),   # matches moseq2-model K_0_scale=10.0
+        V_0   = 0.1 * np.eye(D_phi, dtype=np.float64),  # K_0^{-1} = (10·I)^{-1}
         Psi_0 = Psi_0,
         nu_0  = nu_0,
     )

@@ -70,12 +70,12 @@ class TestBasicFit:
 
     def test_fit_returns_samples(self):
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM, ar_lags=AR_LAGS, seed=0)
-        samples = model.fit(_make_key(), _make_data(), n_iter=N_ITER, verbose=False)
+        samples, _ = model.fit(_make_key(), _make_data(), n_iter=N_ITER, verbose=False)
         assert len(samples) == N_ITER
 
     def test_samples_contain_expected_keys(self):
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM, ar_lags=AR_LAGS, seed=0)
-        samples = model.fit(_make_key(), _make_data(), n_iter=N_ITER, verbose=False)
+        samples, _ = model.fit(_make_key(), _make_data(), n_iter=N_ITER, verbose=False)
         for s in samples:
             assert 'A'     in s
             assert 'Sigma' in s
@@ -84,15 +84,15 @@ class TestBasicFit:
 
     def test_store_every(self):
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM, ar_lags=AR_LAGS, seed=0)
-        samples = model.fit(_make_key(), _make_data(),
-                            n_iter=N_ITER, store_every=2, verbose=False)
+        samples, _ = model.fit(_make_key(), _make_data(),
+                               n_iter=N_ITER, store_every=2, verbose=False)
         assert len(samples) == N_ITER // 2
 
     def test_param_shapes(self):
         D, K, L = OBS_DIM, N_STATES, AR_LAGS
         D_phi = D * L + 1  # affine=True by default
         model = ARHMM(n_states=K, obs_dim=D, ar_lags=L, seed=0)
-        samples = model.fit(_make_key(), _make_data(), n_iter=2, verbose=False)
+        samples, _ = model.fit(_make_key(), _make_data(), n_iter=2, verbose=False)
         s = samples[-1]
         assert s['A'].shape     == (K, D, D_phi)
         assert s['Sigma'].shape == (K, D, D)
@@ -101,19 +101,19 @@ class TestBasicFit:
 
     def test_pi_rows_sum_to_one(self):
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM, ar_lags=AR_LAGS, seed=0)
-        samples = model.fit(_make_key(), _make_data(), n_iter=5, verbose=False)
+        samples, _ = model.fit(_make_key(), _make_data(), n_iter=5, verbose=False)
         pi = samples[-1]['pi']
         np.testing.assert_allclose(pi.sum(axis=1), np.ones(N_STATES), atol=1e-5)
 
     def test_beta_sums_to_one(self):
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM, ar_lags=AR_LAGS, seed=0)
-        samples = model.fit(_make_key(), _make_data(), n_iter=5, verbose=False)
+        samples, _ = model.fit(_make_key(), _make_data(), n_iter=5, verbose=False)
         beta = samples[-1]['beta']
         assert abs(beta.sum() - 1.0) < 1e-5
 
     def test_sigma_positive_definite(self):
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM, ar_lags=AR_LAGS, seed=0)
-        samples = model.fit(_make_key(), _make_data(), n_iter=5, verbose=False)
+        samples, _ = model.fit(_make_key(), _make_data(), n_iter=5, verbose=False)
         Sigma = samples[-1]['Sigma']
         for k in range(N_STATES):
             eigs = np.linalg.eigvalsh(Sigma[k])
@@ -190,8 +190,8 @@ class TestLogLikelihood:
 
         lls = []
         # Use store_every=1 and compute LL from samples directly
-        samples = model.fit(_make_key(3), data,
-                            n_iter=n_iter, store_every=1, verbose=False)
+        samples, _ = model.fit(_make_key(3), data,
+                               n_iter=n_iter, store_every=1, verbose=False)
         for s in samples:
             lls.append(model.log_likelihood(params=s, data_list=data))
 
@@ -340,8 +340,8 @@ class TestSeparateTrans:
         group_ids = ['ctrl'] * (n_sessions // 2) + ['ko'] * (n_sessions // 2)
         model = ARHMM(n_states=N_STATES, obs_dim=OBS_DIM, ar_lags=AR_LAGS,
                       separate_trans=True, seed=6)
-        samples = model.fit(_make_key(6), data, n_iter=N_ITER,
-                            verbose=False, group_ids=group_ids)
+        samples, _ = model.fit(_make_key(6), data, n_iter=N_ITER,
+                               verbose=False, group_ids=group_ids)
         return model, samples, group_ids
 
     def test_separate_trans_fit_does_not_crash(self):
@@ -369,10 +369,7 @@ class TestSeparateTrans:
             )
 
     def test_separate_trans_groups_differ(self):
-        # With kappa=1e6 both groups will have near-identity pi (diagonal ~1-1e-5),
-        # so differences between groups are at the 1e-5 scale, not 1e-3.
-        # We verify the groups are not identical (differ at float precision),
-        # which confirms per-group counts are being accumulated separately.
+        # Verify per-group counts are accumulated separately (matrices differ).
         _, samples, _ = self._fit_separate(n_sessions=8)
         pi_ctrl = samples[-1]['pi_groups']['ctrl']
         pi_ko   = samples[-1]['pi_groups']['ko']
@@ -681,7 +678,7 @@ class TestARHSMM:
     def test_arhsmm_lam_shape(self):
         model = ARHSMM(n_states=8, obs_dim=OBS_DIM, ar_lags=AR_LAGS,
                        max_dur=50, seed=9)
-        samples = model.fit(_make_key(9), _make_data(n_sessions=2, T=300),
-                            n_iter=3, verbose=False)
+        samples, _ = model.fit(_make_key(9), _make_data(n_sessions=2, T=300),
+                               n_iter=3, verbose=False)
         assert samples[-1]['lam'].shape == (8,)
         assert (samples[-1]['lam'] > 0).all()

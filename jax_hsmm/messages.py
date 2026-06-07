@@ -262,6 +262,10 @@ def hsmm_forward(
     T, K = log_likelihoods.shape
     D = max_dur
 
+    # Floor prevents -inf - (-inf) = NaN in the segment likelihood subtraction
+    # (matches pyhsmm's np.maximum(aBl, -1e6) clamp in the Cython path).
+    log_likelihoods = jnp.maximum(log_likelihoods, -1e6)
+
     # cumlik[t, k] = Σ_{s=0}^{t-1} log p(x_s | k)   (cumlik[0, :] = 0)
     cumlik = jnp.concatenate(
         [jnp.zeros((1, K)), jnp.cumsum(log_likelihoods, axis=0)], axis=0
@@ -389,5 +393,97 @@ def hsmm_backward_sample(
         key, subkey = jax.random.split(key)
         log_probs = jnp.array(log_F[t] + log_A[:, z])
         z = int(jax.random.categorical(subkey, log_probs))
+
+    return states
+
+
+def hsmm_viterbi(
+    log_pi0: np.ndarray,
+    log_A: np.ndarray,
+    log_dur: np.ndarray,
+    log_likelihoods: np.ndarray,
+    max_dur: int,
+) -> np.ndarray:
+    """MAP state sequence for HSMM via max-product (true Viterbi).
+
+    Implements the full HSMM Viterbi algorithm with duration backpointers,
+    equivalent to pyhsmm's ``hsmm_maximizing_assignment``.  Runtime is
+    O(T·D·K²); space is O(T·K) for the backpointer tables.
+
+    Args:
+        log_pi0:         (K,)         Log initial-state probabilities.
+        log_A:           (K, K)       Log transition matrix (no self-loops).
+        log_dur:         (K, max_dur) Log duration probabilities.
+        log_likelihoods: (T, K)       Per-frame per-state log likelihoods.
+        max_dur:         int          Maximum segment duration.
+
+    Returns:
+        states: (T,) numpy integer array — MAP per-frame state assignments.
+    """
+    log_likelihoods = np.maximum(np.array(log_likelihoods), -1e6)
+    log_A_np   = np.array(log_A)
+    log_dur_np = np.array(log_dur)   # (K, D)
+    log_pi0_np = np.array(log_pi0)
+
+    T, K = log_likelihoods.shape
+    D = max_dur
+
+    cumlik = np.concatenate(
+        [np.zeros((1, K)), np.cumsum(log_likelihoods, axis=0)], axis=0
+    )  # (T+1, K)
+
+    log_V     = np.full((T, K), -np.inf)
+    psi_state = np.zeros((T, K), dtype=np.int32)   # best previous state
+    psi_dur   = np.ones((T, K),  dtype=np.int32)   # best duration
+
+    for t in range(T):
+        t1   = t + 1
+        n_d  = min(D, t1)
+        d_range = np.arange(1, n_d + 1)           # (n_d,)
+
+        # Previous log_V values: log_V_prev[i] = log_V at time (t - d_range[i]).
+        # Negative indices mean the segment started before the sequence; use
+        # log_pi0 (the virtual start token) for those.
+        prev_times  = t - d_range                  # (n_d,)  may be negative
+        safe_idx    = np.maximum(prev_times, 0)
+        log_V_prev  = np.where(
+            prev_times[:, None] < 0,
+            log_pi0_np[None, :],
+            log_V[safe_idx],                       # (n_d, K)
+        )
+
+        # Segment log-likelihoods: sum log_lik[t-d+1..t, k] for each d.
+        seg_ll = cumlik[t1][None, :] - cumlik[t1 - d_range]  # (n_d, K)
+
+        # Duration log-probs: log_dur[k, d-1] → (n_d, K)
+        dur_ll = log_dur_np[:, :n_d].T            # (n_d, K)
+
+        # Max over previous state j for each (d, k_to).
+        # scores[d, j, k] = log_V_prev[d, j] + log_A[j, k]
+        scores    = log_V_prev[:, :, None] + log_A_np[None, :, :]  # (n_d, K, K)
+        incoming  = scores.max(axis=1)             # (n_d, K)
+        best_from = scores.argmax(axis=1).astype(np.int32)          # (n_d, K)
+
+        combined   = incoming + seg_ll + dur_ll    # (n_d, K)
+        best_d_idx = combined.argmax(axis=0)       # (K,)
+
+        log_V[t]     = combined[best_d_idx, np.arange(K)]
+        psi_state[t] = best_from[best_d_idx, np.arange(K)]
+        psi_dur[t]   = d_range[best_d_idx]
+
+    # Backward traceback.
+    states = np.zeros(T, dtype=np.int32)
+    t = T - 1
+    z = int(np.argmax(log_V[t]))
+
+    while t >= 0:
+        d         = int(psi_dur[t, z])
+        seg_start = max(0, t - d + 1)
+        states[seg_start : t + 1] = z
+        if seg_start == 0:
+            break
+        z_prev = int(psi_state[t, z])
+        t = seg_start - 1
+        z = z_prev
 
     return states
